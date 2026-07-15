@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from urllib.parse import urlparse
 
@@ -1250,7 +1251,45 @@ def _run_browser_use_codex_oauth_once(email: str, otp_provider=None, proxy: str 
                 pass
 
 
-def run_browser_use_codex_oauth(email: str, otp_provider=None, proxy: str | None = None, force: bool = False) -> dict:
+def _has_running_asyncio_loop() -> bool:
+    """当前线程如果已有 asyncio/Playwright 事件循环，不能再启动 sync_playwright。"""
+    try:
+        import asyncio
+        loop = asyncio.get_event_loop()
+        return bool(loop and loop.is_running())
+    except Exception:
+        return False
+
+
+def _run_in_isolated_thread(fn, *args, **kwargs):
+    """在独立线程执行同步 Playwright 流程。
+
+    BrowserUse 注册流程本身已经处于 `with sync_playwright()` 内，注册成功后如果
+    立刻自动跑 Codex BrowserUse，会在同一线程里再次进入 sync_playwright，从而触发：
+      It looks like you are using Playwright Sync API inside the asyncio loop.
+
+    这里复用父线程名启动子线程，保证 registration_service 的按 threadName 日志过滤
+    仍能把 Codex 日志写入同一个任务日志文件。
+    """
+    result_box = {}
+    error_box = {}
+    parent_thread_name = threading.current_thread().name
+
+    def _target():
+        try:
+            result_box["value"] = fn(*args, **kwargs)
+        except BaseException as exc:  # noqa: BLE001 - 需要跨线程回传
+            error_box["error"] = exc
+
+    t = threading.Thread(target=_target, name=parent_thread_name, daemon=False)
+    t.start()
+    t.join()
+    if "error" in error_box:
+        raise error_box["error"]
+    return result_box.get("value")
+
+
+def _run_browser_use_codex_oauth_impl(email: str, otp_provider=None, proxy: str | None = None, force: bool = False) -> dict:
     """Browser Use Codex OAuth 入口；CPA callback 409 timeout 时重新开启一轮授权。"""
     from core import codex_oauth as proto
 
@@ -1276,3 +1315,21 @@ def run_browser_use_codex_oauth(email: str, otp_provider=None, proxy: str | None
         last_result["message"] = f"CPA callback 超时，已重新授权 {max_rounds} 轮仍失败：{last_result.get('message') or ''}"
         return last_result
     return proto._codex_result(status="failed", email=email, message="CPA callback 超时，重新授权失败")
+
+
+def run_browser_use_codex_oauth(email: str, otp_provider=None, proxy: str | None = None, force: bool = False) -> dict:
+    """Browser Use Codex OAuth 入口。
+
+    如果当前线程已经有 Playwright/asyncio loop（典型场景：BrowserUse 注册成功后
+    自动触发 Codex），则切到独立线程执行，避免 sync_playwright 嵌套报错。
+    """
+    if _has_running_asyncio_loop():
+        logger.info("[Codex][BrowserUse] 检测到当前线程已有 Playwright/asyncio loop，切换到隔离线程执行 Codex")
+        return _run_in_isolated_thread(
+            _run_browser_use_codex_oauth_impl,
+            email=email,
+            otp_provider=otp_provider,
+            proxy=proxy,
+            force=force,
+        )
+    return _run_browser_use_codex_oauth_impl(email=email, otp_provider=otp_provider, proxy=proxy, force=force)
