@@ -12,22 +12,14 @@ Flask 本地控制台。
 """
 import logging
 import threading
-from pathlib import Path
 
 from flask import Flask, Response, jsonify, render_template, request
 
-from core import db
+from core import codex_retry_service, db
 from core import registration_service as svc
 from webui import config_editor
 
 logger = logging.getLogger(__name__)
-
-# 正在补跑 Codex 的邮箱集合（进程内防重复触发）
-_codex_retrying: set[str] = set()
-_codex_retrying_lock = threading.Lock()
-
-_LOG_DIR = Path(__file__).resolve().parent.parent / "注册日志"
-
 
 def _pool_source_arg(default: str = "outlook") -> str:
     src = (request.args.get("source") or "").strip()
@@ -46,11 +38,6 @@ def _with_pool_source(rows: list[dict], source: str) -> list[dict]:
             x["copy_line"] = x.get("email") or ""
         out.append(x)
     return out
-
-
-def _codex_retry_log_path(email: str) -> Path:
-    safe = email.replace("/", "_").replace("\\", "_").replace(":", "_")
-    return _LOG_DIR / f"codex-retry-{safe}.log"
 
 
 def create_app() -> Flask:
@@ -635,75 +622,14 @@ def create_app() -> Flask:
 
     def _reserve_codex_retry(email: str) -> bool:
         """进程内防重复占位；成功返回 True。"""
-        with _codex_retrying_lock:
-            if email in _codex_retrying:
-                return False
-            _codex_retrying.add(email)
-            return True
+        return codex_retry_service.reserve(email)
 
     def _release_codex_retry(email: str) -> None:
-        with _codex_retrying_lock:
-            _codex_retrying.discard(email)
+        codex_retry_service.release(email)
 
     def _run_codex_retry_worker(email: str, *, batch_label: str | None = None, clear_log: bool = True) -> None:
         """执行一个账号的 Codex 补跑。调用前必须已经 reserve。"""
-        import logging as _logging
-        from core.codex_oauth import run_codex_oauth
-
-        log_path = _codex_retry_log_path(email)
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        if clear_log:
-            log_path.write_text("", encoding="utf-8")
-
-        thread_name = threading.current_thread().name
-        fh = _logging.FileHandler(str(log_path), encoding="utf-8")
-        fh.setLevel(_logging.DEBUG)
-        fh.setFormatter(_logging.Formatter(
-            "%(asctime)s [%(levelname)s] %(message)s",
-            datefmt="%H:%M:%S",
-        ))
-        fh.addFilter(lambda r: r.threadName == thread_name)
-        _logging.getLogger().addHandler(fh)
-        try:
-            # 补跑线程启动时再热加载一次配置，避免用户刚保存 Roxy 配置后，后台线程仍读到旧模块值。
-            try:
-                import config as _config_pkg
-                _config_pkg.reload_all()
-                from config import roxybrowser as _roxy_cfg
-                from config import codex as _codex_cfg
-                logger.info(
-                    "[Codex 补跑] 已热加载配置：CODEX_OAUTH_DRIVER=%s ROXY_OPEN_HEADLESS=%s ROXY_KEEP_BROWSER_OPEN=%s",
-                    getattr(_codex_cfg, "CODEX_OAUTH_DRIVER", ""),
-                    getattr(_roxy_cfg, "ROXY_OPEN_HEADLESS", ""),
-                    getattr(_roxy_cfg, "ROXY_KEEP_BROWSER_OPEN", ""),
-                )
-            except Exception as exc:
-                logger.warning("[Codex 补跑] 配置热加载失败，将继续使用当前内存配置：%s: %s", type(exc).__name__, exc)
-            if batch_label:
-                logger.info(f"[Codex 补跑] 批量任务：{batch_label}")
-            logger.info(f"[Codex 补跑] 开始：{email}")
-            logger.info("[Codex 补跑] 阶段说明：获取授权地址 → 登录邮箱 → 邮箱 OTP → 手机验证 → 捕获 callback → 提交/保存凭证")
-            result = run_codex_oauth(email, force=True)
-            logger.info(f"[Codex 补跑] 结果：status={result.get('status')} ok={result.get('ok')} file={result.get('file_path')} callback={result.get('callback_url')}")
-            result_status = result.get("status", "failed")
-            if result.get("ok"):
-                db.update_account_codex_status(email, "success", None)
-                logger.info(f"[Codex 补跑] {email} 成功")
-            elif result_status == "deactivated":
-                db.update_account_codex_status(email, "deactivated", result.get("message"))
-                logger.warning(f"[Codex 补跑] {email} 账号已废: {result.get('message')}")
-            else:
-                db.update_account_codex_status(email, result_status, result.get("message"))
-                logger.warning(f"[Codex 补跑] {email} 失败: {result.get('message')}")
-        except Exception as exc:
-            db.update_account_codex_status(email, "failed", f"{type(exc).__name__}: {exc}")
-            logger.exception(f"[Codex 补跑] {email} 异常")
-            logger.error("[Codex 补跑] 已结束：异常失败")
-        finally:
-            logger.info(f"[Codex 补跑] 结束：{email}")
-            _logging.getLogger().removeHandler(fh)
-            fh.close()
-            _release_codex_retry(email)
+        codex_retry_service.run_worker(email, batch_label=batch_label, clear_log=clear_log)
 
     @app.post("/api/codex/reset-retrying")
     def api_codex_reset_retrying():
@@ -733,7 +659,7 @@ def create_app() -> Flask:
         _release_codex_retry(email)
 
         try:
-            log_path = _codex_retry_log_path(email)
+            log_path = codex_retry_service.log_path(email)
             log_path.parent.mkdir(parents=True, exist_ok=True)
             with log_path.open("a", encoding="utf-8") as f:
                 ts = _dt.now().strftime("%H:%M:%S")
@@ -821,7 +747,7 @@ def create_app() -> Flask:
         for item in selected:
             email = item["email"]
             db.update_account_codex_status(email, "retrying", None)
-            log_path = _codex_retry_log_path(email)
+            log_path = codex_retry_service.log_path(email)
             log_path.parent.mkdir(parents=True, exist_ok=True)
             log_path.write_text(
                 f"{_dt.now().strftime('%H:%M:%S')} [INFO] [Codex 批量补跑] 已加入批量任务 batch={batch_id} workers={workers}，等待线程执行\n",
@@ -860,7 +786,7 @@ def create_app() -> Flask:
         email = (request.args.get("email") or "").strip()
         if not email:
             return jsonify({"ok": False, "error": "email 为空"}), 400
-        p = _codex_retry_log_path(email)
+        p = codex_retry_service.log_path(email)
         if not p.exists():
             return jsonify({"ok": True, "log": "", "running": False})
         max_bytes = 50_000
@@ -872,7 +798,7 @@ def create_app() -> Flask:
         return jsonify({
             "ok": True,
             "log": content,
-            "running": email in _codex_retrying,
+            "running": codex_retry_service.is_retrying(email),
         })
 
     # ----------------------------------------------------------
@@ -886,6 +812,7 @@ def create_app() -> Flask:
         rows = db.list_jobs(limit=limit)
         for row in rows:
             row["manual_otp_required"] = manual_otp_required
+            row.update(svc.get_retry_info(row))
         return jsonify(rows)
 
     @app.post("/api/jobs")
@@ -1032,13 +959,71 @@ def create_app() -> Flask:
             return jsonify({"ok": False, "error": result.get("error") or "停止失败"}), int(result.get("status") or 400)
         return jsonify(result)
 
+    @app.post("/api/jobs/<int:job_id>/retry")
+    def api_job_retry(job_id: int):
+        """重试失败/停止/取消任务；服务端自动判断完整注册或 Codex 补跑。"""
+        data = request.get_json(silent=True) or {}
+        try:
+            workers = max(1, min(16, int(data.get("workers", svc.get_executor_workers()))))
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "workers 非法"}), 400
+        result = svc.retry_job(job_id, workers=workers)
+        if not result.get("ok"):
+            return jsonify(result), int(result.get("status") or 400)
+        return jsonify(result)
+
+    @app.post("/api/jobs/retry-bulk")
+    def api_jobs_retry_bulk():
+        """批量重试任务；不支持项逐条跳过并返回原因。"""
+        data = request.get_json(silent=True) or {}
+        job_ids = data.get("job_ids") or data.get("ids") or []
+        if not isinstance(job_ids, list) or not job_ids:
+            return jsonify({"ok": False, "error": "job_ids 必须是非空数组"}), 400
+        if len(job_ids) > 500:
+            return jsonify({"ok": False, "error": "单次最多重试 500 个任务"}), 400
+        try:
+            workers = max(1, min(16, int(data.get("workers", svc.get_executor_workers()))))
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "workers 非法"}), 400
+
+        started: list[dict] = []
+        reused: list[dict] = []
+        skipped: list[dict] = []
+        seen: set[int] = set()
+        for raw_id in job_ids:
+            try:
+                one_id = int(raw_id)
+            except (TypeError, ValueError):
+                skipped.append({"id": raw_id, "reason": "ID 非法"})
+                continue
+            if one_id in seen:
+                continue
+            seen.add(one_id)
+            result = svc.retry_job(one_id, workers=workers)
+            if not result.get("ok"):
+                skipped.append({"id": one_id, "reason": result.get("error") or "不能重试"})
+            elif result.get("reused"):
+                reused.append(result)
+            else:
+                started.append(result)
+        return jsonify({
+            "ok": True,
+            "started": started,
+            "started_count": len(started),
+            "reused": reused,
+            "reused_count": len(reused),
+            "skipped": skipped,
+            "skipped_count": len(skipped),
+            "workers": workers,
+        })
+
     @app.post("/api/jobs/<int:job_id>/delete")
     def api_job_delete(job_id: int):
         """删除一个任务记录。运行中的任务不允许删除；排队任务删除后执行前会自动跳过。"""
         job = db.get_job(job_id)
         if not job:
             return jsonify({"ok": False, "error": "任务不存在"}), 404
-        if job.get("status") == "running":
+        if job.get("status") in ("running", "stopping"):
             return jsonify({"ok": False, "error": "运行中的任务不能删除，请等待完成后再删"}), 409
         deleted = db.delete_job(job_id, delete_log=True, allow_running=False)
         if not deleted:
@@ -1072,7 +1057,7 @@ def create_app() -> Flask:
             if not job:
                 skipped.append({"id": job_id, "reason": "任务不存在"})
                 continue
-            if job.get("status") == "running":
+            if job.get("status") in ("running", "stopping"):
                 skipped.append({"id": job_id, "reason": "运行中，不能删除"})
                 continue
             if db.delete_job(job_id, delete_log=True, allow_running=False):

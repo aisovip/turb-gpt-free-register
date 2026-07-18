@@ -120,7 +120,7 @@
     .col-expire { width: 168px; }
     .col-error { width: 320px; }
     .col-actions { width: 220px; }
-    .jobs-table .col-actions { width: 230px; }
+    .jobs-table .col-actions { width: 330px; }
     .accounts-table .col-token { width: 92px; }
     .accounts-table .col-plan { width: 340px; }
     .accounts-table .col-actions { width: 360px; }
@@ -138,6 +138,7 @@
     .status-used, .status-cancelled, .status-stopped, .status-disabled { color: #475467; background: #f2f4f7; }
     .status-stopping { color: var(--amber); background: #fff7e6; }
     .status-failed { color: var(--red); background: #fff0ef; }
+    .status-partial_success { color: #9a6700; background: #fff7d6; }
     .status-running { color: var(--amber); background: #fff7e6; }
     .status-success { color: var(--green); background: #e9f7ef; }
     .actions { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
@@ -309,6 +310,7 @@
         <div><h2>任务列表</h2></div>
         <div class="buttons">
           <span class="muted" id="jobsSelectedHint" style="font-size:12px;align-self:center;margin-right:4px;">已选 0</span>
+          <button class="btn good" id="btnRetrySelectedJobs" disabled title="重试选中的失败、已停止或已取消任务">重试选中</button>
           <button class="btn" id="btnDeleteSelectedJobs" disabled title="删除选中的非运行中任务，并同时删除对应日志">删除选中</button>
           <button class="btn" id="btnCancelPending" title="把所有 status=排队 的任务标记为已取消，不再执行（已运行中的不影响）">取消所有排队</button>
           <button class="btn" id="btnRefreshJobs">手动刷新</button>
@@ -505,6 +507,7 @@ let ACCOUNTS = [], OUTLOOK = [], CONFIG = [];
 const ACCOUNT_SELECTED = new Set();
 const OUTLOOK_SELECTED = new Set();
 let JOBS = [];
+let jobsRenderSignature = '';
 const JOB_SELECTED = new Set();
 let activeLogJob = null, logTimer = null, jobsTimer = null;
 
@@ -561,7 +564,7 @@ function short(v, n=40) { const s = v || ''; return s.length > n ? s.slice(0,n)+
 function copyId(v) { if (!v) return ''; const id = 'c'+(++copySeq); copyStore.set(id, v); return id; }
 function cbtn(label, value, cls='') { const id = copyId(value); return `<button class="${cls}" data-copy-id="${id}" ${id?'':'disabled'}>${label}</button>`; }
 function pill(status) {
-  const map = { available:'可用', used:'已用', failed:'失败', disabled:'已停用', pending:'排队', running:'运行中', stopping:'停止中', stopped:'已停止', success:'成功', cancelled:'已取消' };
+  const map = { available:'可用', used:'已用', failed:'失败', partial_success:'部分成功', disabled:'已停用', pending:'排队', running:'运行中', stopping:'停止中', stopped:'已停止', success:'成功', cancelled:'已取消' };
   return `<span class="pill status-${esc(status)}">${esc(map[status]||status||'-')}</span>`;
 }
 function showToast(t) { const el=$('#toast'); el.textContent=t; el.classList.add('show'); clearTimeout(showToast.t); showToast.t=setTimeout(()=>el.classList.remove('show'),1400); }
@@ -634,12 +637,13 @@ $('#btnRefreshJobs').addEventListener('click', refreshJobs);
 $('#jobsSelectAll').addEventListener('change', (e) => {
   const p = PAGERS.jobs;
   const pageRows = JOBS.slice((p.page - 1) * p.size, p.page * p.size)
-    .filter(j => j.status !== 'running');
+    .filter(j => !['running','stopping'].includes(j.status));
   if (e.target.checked) pageRows.forEach(j => JOB_SELECTED.add(Number(j.id)));
   else pageRows.forEach(j => JOB_SELECTED.delete(Number(j.id)));
   renderJobs();
 });
 $('#btnDeleteSelectedJobs').addEventListener('click', deleteSelectedJobs);
+$('#btnRetrySelectedJobs').addEventListener('click', retrySelectedJobs);
 $('#btnCancelPending').addEventListener('click', async () => {
   const pendingCount = JOBS.filter(j => j.status === 'pending').length;
   if (pendingCount === 0) { showToast('当前没有排队任务'); return; }
@@ -657,15 +661,15 @@ function renderJobs() {
   const p = PAGERS.jobs;
   const total = JOBS.length;
   const rows = JOBS.slice((p.page - 1) * p.size, p.page * p.size);
-  const selectableIdsAll = new Set(JOBS.filter(j => j.status !== 'running').map(j => Number(j.id)));
+  const selectableIdsAll = new Set(JOBS.filter(j => !['running','stopping'].includes(j.status)).map(j => Number(j.id)));
   for (const id of Array.from(JOB_SELECTED)) {
     if (!selectableIdsAll.has(Number(id))) JOB_SELECTED.delete(id);
   }
   $('#jobsBody').innerHTML = rows.map(j => `
     <tr>
-      <td><input type="checkbox" class="job-row-check" data-job-id="${esc(j.id)}" ${JOB_SELECTED.has(Number(j.id)) ? 'checked' : ''} ${j.status === 'running' ? 'disabled title="运行中的任务不能选择删除"' : ''}></td>
-      <td class="muted">#${esc(j.id)}</td>
-      <td>${pill(j.status)}</td>
+      <td><input type="checkbox" class="job-row-check" data-job-id="${esc(j.id)}" ${JOB_SELECTED.has(Number(j.id)) ? 'checked' : ''} ${['running','stopping'].includes(j.status) ? 'disabled title="运行中的任务不能选择"' : ''}></td>
+      <td class="muted">#${esc(j.id)}${j.parent_job_id ? `<div class="sub-cell" title="重试自任务 #${esc(j.parent_job_id)}">↳ #${esc(j.parent_job_id)} · ${esc(j.retry_attempt || 1)}</div>` : ''}</td>
+      <td>${pill(j.display_status || j.status)}</td>
       <td title="${esc(j.email || '-')}">${esc(j.email || '-')}</td>
       <td class="muted" title="${esc(j.started_at || '-')}">${esc(j.started_at || '-')}</td>
       <td class="muted" title="${esc(j.completed_at || '-')}">${esc(j.completed_at || '-')}</td>
@@ -678,7 +682,8 @@ function renderJobs() {
             <button class="good" data-submit-otp-job="${esc(j.id)}" data-email="${esc(j.email)}">提交验证码</button>
           ` : ''}
           ${['pending','running','stopping'].includes(j.status) ? `<button class="danger" data-stop-job="${esc(j.id)}">${j.status === 'stopping' ? '停止/修复' : '停止'}</button>` : ''}
-          <button class="danger" data-delete-job="${esc(j.id)}" ${j.status === 'running' ? 'disabled title="运行中的任务不能删除；如需删除请先停止"' : ''}>删除</button>
+          ${j.retryable ? `<button class="good" data-retry-job="${esc(j.id)}" title="${esc(j.retry_action === 'codex' ? '账号已创建，仅补跑 Codex 授权' : '创建新的注册任务，不覆盖原任务')}">${esc(j.retry_label || '重试')}</button>` : ''}
+          <button class="danger" data-delete-job="${esc(j.id)}" ${['running','stopping'].includes(j.status) ? 'disabled title="运行中的任务不能删除；如需删除请先停止"' : ''}>删除</button>
         </div>
       </td>
     </tr>`).join('') || '<tr><td colspan="8" class="muted">暂无任务</td></tr>';
@@ -689,8 +694,12 @@ function renderJobs() {
 function updateJobsSelectionUi(pageRows = null) {
   const hint = $('#jobsSelectedHint');
   const bulkBtn = $('#btnDeleteSelectedJobs');
+  const bulkRetryBtn = $('#btnRetrySelectedJobs');
   if (hint) hint.textContent = `已选 ${JOB_SELECTED.size}`;
   if (bulkBtn) bulkBtn.disabled = JOB_SELECTED.size === 0;
+  if (bulkRetryBtn) {
+    bulkRetryBtn.disabled = !Array.from(JOB_SELECTED).some(id => JOBS.find(j => Number(j.id) === Number(id))?.retryable);
+  }
 
   const cbAll = $('#jobsSelectAll');
   if (!cbAll) return;
@@ -698,7 +707,7 @@ function updateJobsSelectionUi(pageRows = null) {
     const p = PAGERS.jobs;
     pageRows = JOBS.slice((p.page - 1) * p.size, p.page * p.size);
   }
-  const selectableIds = pageRows.filter(j => j.status !== 'running').map(j => Number(j.id));
+  const selectableIds = pageRows.filter(j => !['running','stopping'].includes(j.status)).map(j => Number(j.id));
   const checkedCount = selectableIds.filter(id => JOB_SELECTED.has(id)).length;
   cbAll.checked = selectableIds.length > 0 && checkedCount === selectableIds.length;
   cbAll.indeterminate = checkedCount > 0 && checkedCount < selectableIds.length;
@@ -707,8 +716,13 @@ function updateJobsSelectionUi(pageRows = null) {
 
 async function refreshJobs() {
   try {
-    JOBS = await api('/api/jobs?limit=500');
-    renderJobs();
+    const nextJobs = await api('/api/jobs?limit=500');
+    const nextSignature = JSON.stringify(nextJobs);
+    JOBS = nextJobs;
+    if (nextSignature !== jobsRenderSignature) {
+      jobsRenderSignature = nextSignature;
+      renderJobs();
+    }
     loadSummary();
   } catch(e) {}
 }
@@ -742,6 +756,14 @@ function closeRetryLogModal() {
   updateModalScrollLock();
 }
 
+$('#jobsBody').addEventListener('pointerdown', (e) => {
+  const retryBtn = e.target.closest('[data-retry-job]');
+  if (!retryBtn || retryBtn.disabled || e.button !== 0) return;
+  e.preventDefault();
+  retryBtn.dataset.pointerHandled = '1';
+  retryJob(parseInt(retryBtn.dataset.retryJob, 10), retryBtn);
+});
+
 $('#jobsBody').addEventListener('click', (e) => {
   const logBtn = e.target.closest('[data-log-job]');
   if (logBtn) {
@@ -756,6 +778,15 @@ $('#jobsBody').addEventListener('click', (e) => {
   const stopBtn = e.target.closest('[data-stop-job]');
   if (stopBtn) {
     stopJob(parseInt(stopBtn.dataset.stopJob, 10), stopBtn);
+    return;
+  }
+  const retryBtn = e.target.closest('[data-retry-job]');
+  if (retryBtn) {
+    if (retryBtn.dataset.pointerHandled === '1') {
+      delete retryBtn.dataset.pointerHandled;
+      return;
+    }
+    retryJob(parseInt(retryBtn.dataset.retryJob, 10), retryBtn);
     return;
   }
   const delBtn = e.target.closest('[data-delete-job]');
@@ -861,6 +892,52 @@ async function deleteSelectedJobs() {
   }
 }
 
+async function retryJob(jobId, btn) {
+  const job = JOBS.find(j => Number(j.id) === Number(jobId));
+  if (!job || !job.retryable) { showToast('该任务当前不可重试'); return; }
+  const actionText = job.retry_action === 'codex' ? '仅补跑 Codex 授权' : '创建新的完整注册任务';
+  if (!confirm(`确定${job.retry_label || '重试'}任务 #${jobId}？\n\n${actionText}\n原任务记录和日志会保留。`)) return;
+  btn.disabled = true;
+  try {
+    const r = await api(`/api/jobs/${jobId}/retry`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({}),
+    });
+    showToast(r.message || '已提交重试任务');
+    JOB_SELECTED.delete(Number(jobId));
+    refreshJobs();
+  } catch (e) {
+    showToast('重试失败: ' + e.message);
+    btn.disabled = false;
+  }
+}
+
+async function retrySelectedJobs() {
+  const ids = Array.from(JOB_SELECTED);
+  const retryable = ids.filter(id => JOBS.find(j => Number(j.id) === Number(id))?.retryable);
+  if (retryable.length === 0) { showToast('选中的任务没有可重试项'); return; }
+  if (!confirm(`确定重试选中的 ${retryable.length} 个任务吗？\n\n已创建账号的任务只补跑 Codex，其余任务重新入队注册。`)) return;
+  const btn = $('#btnRetrySelectedJobs');
+  btn.disabled = true;
+  try {
+    const r = await api('/api/jobs/retry-bulk', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({job_ids: retryable}),
+    });
+    retryable.forEach(id => JOB_SELECTED.delete(Number(id)));
+    const skippedCount = (r.skipped || []).length;
+    const reusedCount = r.reused_count || 0;
+    showToast(`已提交 ${r.started_count || 0} 个${reusedCount ? `，复用 ${reusedCount} 个` : ''}${skippedCount ? `，跳过 ${skippedCount} 个` : ''}`);
+    refreshJobs();
+  } catch (e) {
+    showToast('批量重试失败: ' + e.message);
+  } finally {
+    updateJobsSelectionUi();
+  }
+}
+
 function openLog(jobId) {
   activeLogJob = jobId;
   $('#logJobId').textContent = jobId;
@@ -879,7 +956,7 @@ async function pollLog() {
     const atBottom = c.scrollTop + c.clientHeight >= c.scrollHeight - 30;
     c.textContent = r.log || '(暂无日志)';
     if (atBottom) c.scrollTop = c.scrollHeight;
-    if (r.job && ['success','failed'].includes(r.job.status)) clearInterval(logTimer);
+    if (r.job && ['success','failed','stopped','cancelled'].includes(r.job.status)) clearInterval(logTimer);
   } catch(e) {}
 }
 
